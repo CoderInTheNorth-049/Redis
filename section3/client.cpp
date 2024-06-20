@@ -31,4 +31,17 @@ int main(){
     if (rv) {
         die("connect");  // If connection fails, print error and abort
     }
+
+    char msg[] = "hello"; // Message to be sent to the server
+    write(fd, msg, strlen(msg)); // Send the message to the server
+
+    char rbuf[64] = {}; // Buffer to store the response from the server
+    ssize_t n = read(fd, rbuf, sizeof(rbuf) - 1); // Read the response from the server
+    if (n < 0) {
+        die("read");  // If reading fails, print error and abort
+    }
+
+    printf("server says: %s\n", rbuf);// Print the server's response
+    close(fd); // Close the socket before exiting
+    return 0;
 }
