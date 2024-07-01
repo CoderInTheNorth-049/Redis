@@ -12,14 +12,13 @@
 #include <netinet/ip.h>
 #include <string>
 #include <vector>
-#include "hashtable.h"
+#include <cmath>
+#include "hashtable.cpp"
+#include "zset.cpp"
+#include "avl.cpp"
+#include "common.h"
 
 using namespace std;
-
-#define container_of(ptr, type, member) ({                  \
-    const typeof( ((type *)0)->member ) *__mptr = (ptr);    \
-    (type *)( (char *)__mptr - offsetof(type, member) );})
-
 
 static void msg(const char* msg){
     fprintf(stderr, "%s\n", msg);
@@ -134,11 +133,18 @@ static struct {
     HMap db;
 } g_data;
 
+enum{
+    T_STR = 0,
+    T_ZSET = 1,
+};
+
 // the structure for the key
 struct Entry {
     struct HNode node;
     string key;
     string val;
+    uint32_t type = 0;
+    ZSet *zset = NULL;
 };
 
 // Define a function to compare two HNode entries based on their 'key' field
@@ -151,42 +157,41 @@ static bool entry_eq(HNode *lhs, HNode *rhs) {
     return le->key == re->key;
 }
 
-// Define a function to compute the hash value of a given data buffer with a specified length
-static uint64_t str_hash(const uint8_t *data, size_t len) {
-    uint32_t h = 0x811C9DC5;  // Initial hash value
-    for (size_t i = 0; i < len; i++) {
-        h = (h + data[i]) * 0x01000193;  // Update the hash value using the FNV-1a algorithm
-    }
-    return h;  // Return the computed hash value
-}
-
 enum {
     ERR_UNKNOWN = 1,  // Represents an unknown error
     ERR_2BIG = 2,     // Represents an error indicating a size that's too big
+    ERR_TYPE = 3,     // Represents an error related to an incorrect type
+    ERR_ARG = 4,      // Represents an error related to an incorrect argument
 };
 
-enum {
-    SER_NIL = 0,  // Represents a nil or null value
-    SER_ERR = 1,  // Represents an error
-    SER_STR = 2,  // Represents a string
-    SER_INT = 3,  // Represents an integer
-    SER_ARR = 4,  // Represents an array
-};
 
 static void out_nil(string& out){
     out.push_back(SER_NIL); // Append the SER_NIL byte to indicate a nil value
 }
 
-static void out_str(string& out,const string& val){
-    out.push_back(SER_STR); // Append the SER_STR byte to indicate a string
-    uint32_t len = (uint32_t)val.size(); // Get the length of the string
-    out.append((char*)&len, 4); // Append the length of the string (4 bytes)
-    out.append(val); // Append the actual string data
+// Function to serialize a string and append it to the output buffer.
+static void out_str(string &out, const char *s, size_t size) {
+    out.push_back(SER_STR);           // Append the string type identifier.
+    uint32_t len = (uint32_t)size;    // Get the length of the string.
+    out.append((char *)&len, 4);      // Append the length of the string as 4 bytes.
+    out.append(s, len);               // Append the actual string data.
 }
 
-static void out_int(std::string &out, int64_t val) {
+// Overloaded function to serialize a std::string and append it to the output buffer.
+static void out_str(string &out, const string &val) {
+    return out_str(out, val.data(), val.size()); // Call the previous function with std::string data.
+}
+
+
+static void out_int(string &out, int64_t val) {
     out.push_back(SER_INT); // Append the SER_INT byte to indicate an integer
     out.append((char *)&val, 8); // Append the integer value (8 bytes)
+}
+
+// Function to serialize a double and append it to the output buffer.
+static void out_dbl(std::string &out, double val) {
+    out.push_back(SER_DBL);         // Append the double type identifier.
+    out.append((char *)&val, 8);    // Append the 8-byte representation of the double value.
 }
 
 static void out_err(std::string &out, int32_t code, const std::string &msg) {
@@ -197,69 +202,99 @@ static void out_err(std::string &out, int32_t code, const std::string &msg) {
     out.append(msg); // Append the actual error message
 }
 
-static void out_arr(std::string &out, uint32_t n) {
+static void out_arr(string &out, uint32_t n) {
     out.push_back(SER_ARR); // Append the SER_ARR byte to indicate an array
     out.append((char *)&n, 4); // Append the number of elements in the array (4 bytes)
 }
 
+// Function to begin an array serialization
+static void *begin_arr(std::string &out) {
+    out.push_back(SER_ARR);            // Append the array type identifier
+    out.append("\0\0\0\0", 4);         // Reserve space for the array length (4 bytes)
+    return (void *)(out.size() - 4);   // Return the position (ctx) where the array length will be written later
+}
 
-static void do_get(vector<string>& cmd, string& out) {
+// Function to end an array serialization
+static void end_arr(std::string &out, void *ctx, uint32_t n) {
+    size_t pos = (size_t)ctx;          // Retrieve the position (ctx) where the array length is to be written
+    assert(out[pos - 1] == SER_ARR);   // Ensure that the position corresponds to an array type identifier
+    memcpy(&out[pos], &n, 4);          // Write the array length at the reserved position
+}
+
+// Function to handle a "get" command
+static void do_get(std::vector<std::string> &cmd, std::string &out) {
     Entry key;
-    key.key.swap(cmd[1]);
+    key.key.swap(cmd[1]);   // Move the key from the command into the 'key' variable
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size()); // Compute the hash code for the key
 
-    // Compute the hash code for key.key and assign it to key.node.hcode
-    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-
-    // Lookup key.node in the hash map g_data.db using the entry_eq function for equality comparison
+    // Look up the key in the hash map
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-
-    if (!node) { // If node is NULL, the key was not found in the hash map
-        return out_nil(out);
+    if (!node) {    // If the key is not found
+        return out_nil(out);    // Output a "nil" value
     }
 
-    const string& val = container_of(node, Entry, node)->val; // Get the value associated with the key
-    out_str(out, val);
+    // Retrieve the Entry corresponding to the found node
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_STR) {   // If the entry type is not a string
+        return out_err(out, ERR_TYPE, "expect string type");    // Output an error indicating the type mismatch
+    }
+    return out_str(out, ent->val);    // Output the string value of the entry
 }
 
-static void do_set(vector<string>& cmd, string& out) {
-    Entry key;
-    key.key.swap(cmd[1]);
-    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-    if (node) { // If node is not NULL, update its value
-        container_of(node, Entry, node)->val.swap(cmd[2]); // Swap cmd[2] with the value in the corresponding Entry structure
-    } else { // If node is NULL, insert a new Entry structure into the hash map
-        Entry *ent = new Entry(); // Allocate memory for a new Entry structure
-        ent->key.swap(key.key); // Swap key.key with ent->key
-        ent->node.hcode = key.node.hcode; // Assign key.node.hcode to ent->node.hcode
-        ent->val.swap(cmd[2]); // Swap cmd[2] with ent->val
-        hm_insert(&g_data.db, &ent->node); // Insert ent->node into the hash map
+static void do_set(std::vector<std::string> &cmd, std::string &out) {  // Handles setting values in a database
+    Entry key;  // Create an Entry object for the key-value pair
+    key.key.swap(cmd[1]);  // Extract and take ownership of the key from cmd[1]
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());  // Calculate hash code for the key
+
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);  // Look up the key in the global database
+    if (node) {  // If key exists
+        Entry *ent = container_of(node, Entry, node);  // Retrieve the Entry associated with the key
+        if (ent->type != T_STR) {  // Check if the Entry type is not string
+            return out_err(out, ERR_TYPE, "expect string type");  // Return error for incorrect type
+        }
+        ent->val.swap(cmd[2]);  // Replace current value with new value from cmd[2]
+    } else {  // If key does not exist
+        Entry *ent = new Entry();  // Create a new Entry object
+        ent->key.swap(key.key);  // Take ownership of the key
+        ent->node.hcode = key.node.hcode;  // Set hash code for the Entry
+        ent->val.swap(cmd[2]);  // Take ownership of the value from cmd[2]
+        hm_insert(&g_data.db, &ent->node);  // Insert Entry into the database
     }
-    return out_nil(out);
+    return out_nil(out);  // Output nil value
 }
 
-static void do_del(vector<string>& cmd, string& out) {
-    Entry key;
-    key.key.swap(cmd[1]);
-    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-
-    HNode *node = hm_pop(&g_data.db, &key.node, &entry_eq);
-    if (node) { // If node is not NULL, delete the corresponding Entry structure
-        delete container_of(node, Entry, node);
+static void entry_del(Entry *ent) {  // Deletes an Entry from the database
+    switch (ent->type) {  // Check the type of the Entry
+    case T_ZSET:  // If Entry type is a sorted set
+        zset_dispose(ent->zset);  // Dispose of the associated sorted set
+        delete ent->zset;  // Deallocate memory for the sorted set object
+        break;
     }
-    return out_int(out, node ? 1:0);
+    delete ent;  // Deallocate memory for the Entry object
 }
 
-static void h_scan(HTab *tab, void (*f)(HNode *, void *), void *arg) {
-    if (tab->size == 0) {
-        return; // If the table is empty, return immediately
+static void do_del(std::vector<std::string> &cmd, std::string &out) {  // Handles deleting an entry from the database
+    Entry key;  // Create an Entry object for the key to be deleted
+    key.key.swap(cmd[1]);  // Extract and take ownership of the key from cmd[1]
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());  // Calculate hash code for the key
+
+    HNode *node = hm_pop(&g_data.db, &key.node, &entry_eq);  // Pop the Entry associated with the key from the database
+    if (node) {  // If Entry was found and removed
+        entry_del(container_of(node, Entry, node));  // Delete the Entry
     }
-    for (size_t i = 0; i < tab->mask + 1; ++i) { // Iterate over each bucket in the hash table
-        HNode *node = tab->tab[i]; // Get the head node of the current bucket
-        while (node) { // Iterate through the linked list of nodes in the current bucket
-            f(node, arg); // Apply the function f to the current node, passing arg as an additional argument
-            node = node->next; // Move to the next node in the linked list
+    return out_int(out, node ? 1 : 0);  // Output 1 if Entry was deleted, otherwise 0
+}
+
+static void h_scan(HTab *tab, void (*f)(HNode *, void *), void *arg) {  // Scans through a hash table and applies a function to each node
+    if (tab->size == 0) {  // If hash table is empty, return immediately
+        return;
+    }
+    for (size_t i = 0; i < tab->mask + 1; ++i) {  // Iterate through each slot in the hash table
+        HNode *node = tab->tab[i];  // Get the first node in the current slot
+        while (node) {  // Iterate through linked list of nodes in the slot
+            f(node, arg);  // Apply the function f to the current node with argument arg
+            node = node->next;  // Move to the next node in the linked list
         }
     }
 }
@@ -276,23 +311,181 @@ static void do_keys(vector<string> &cmd, string &out) {
     h_scan(&g_data.db.ht2, &cb_scan, &out);
 }
 
+// Function to convert string to double
+static bool str2dbl(const std::string &s, double &out) {
+    char *endp = NULL;
+    out = strtod(s.c_str(), &endp);  // Convert string to double
+    return endp == s.c_str() + s.size() && !isnan(out);  // Check if conversion successful and result is not NaN
+}
+
+// Function to convert string to int64_t
+static bool str2int(const std::string &s, int64_t &out) {
+    char *endp = NULL;
+    out = strtoll(s.c_str(), &endp, 10);  // Convert string to int64_t
+    return endp == s.c_str() + s.size();  // Check if conversion successful
+}
+
+// Function to handle ZADD command
+static void do_zadd(std::vector<std::string> &cmd, std::string &out) {
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        return out_err(out, ERR_ARG, "expect fp number");  // Return error if score conversion fails
+    }
+
+    // Look up or create the zset entry
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    Entry *ent = NULL;
+    if (!hnode) {
+        ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->type = T_ZSET;
+        ent->zset = new ZSet();
+        hm_insert(&g_data.db, &ent->node);  // Insert new zset entry into database
+    } else {
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_ZSET) {
+            return out_err(out, ERR_TYPE, "expect zset");  // Return error if existing entry is not a zset
+        }
+    }
+
+    // Add or update the tuple in the zset
+    const std::string &name = cmd[3];
+    bool added = zset_add(ent->zset, name.data(), name.size(), score);  // Add or update tuple in zset
+    return out_int(out, (int64_t)added);  // Return result as integer (1 if added, 0 if updated)
+}
+
+// Function to expect a zset entry and return false if not found or not a zset
+static bool expect_zset(std::string &out, std::string &s, Entry **ent) {
+    Entry key;
+    key.key.swap(s);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) {
+        out_nil(out);  // Output nil if entry not found
+        return false;
+    }
+
+    *ent = container_of(hnode, Entry, node);
+    if ((*ent)->type != T_ZSET) {
+        out_err(out, ERR_TYPE, "expect zset");  // Output error if entry is not a zset
+        return false;
+    }
+    return true;
+}
+
+// Function to handle ZREM command
+static void do_zrem(std::vector<std::string> &cmd, std::string &out) {
+    Entry *ent = NULL;
+    if (!expect_zset(out, cmd[1], &ent)) {
+        return;  // Return if entry is not a zset or not found
+    }
+
+    const std::string &name = cmd[2];
+    ZNode *znode = zset_pop(ent->zset, name.data(), name.size());  // Remove tuple from zset
+    if (znode) {
+        znode_del(znode);  // Delete znode if found
+    }
+    return out_int(out, znode ? 1 : 0);  // Return result as integer (1 if deleted, 0 if not found)
+}
+
+// Function to handle ZSCORE command
+static void do_zscore(std::vector<std::string> &cmd, std::string &out) {
+    Entry *ent = NULL;
+    if (!expect_zset(out, cmd[1], &ent)) {
+        return;  // Return if entry is not a zset or not found
+    }
+
+    const std::string &name = cmd[2];
+    ZNode *znode = zset_lookup(ent->zset, name.data(), name.size());  // Lookup tuple in zset
+    return znode ? out_dbl(out, znode->score) : out_nil(out);  // Output score or nil if not found
+}
+
+// Function to handle ZQUERY command
+static void do_zquery(std::vector<std::string> &cmd, std::string &out) {
+    // Parse command arguments
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        return out_err(out, ERR_ARG, "expect fp number");  // Return error if score conversion fails
+    }
+    const std::string &name = cmd[3];
+    int64_t offset = 0;
+    int64_t limit = 0;
+    if (!str2int(cmd[4], offset)) {
+        return out_err(out, ERR_ARG, "expect int");  // Return error if offset conversion fails
+    }
+    if (!str2int(cmd[5], limit)) {
+        return out_err(out, ERR_ARG, "expect int");  // Return error if limit conversion fails
+    }
+
+    // Retrieve zset entry from database
+    Entry *ent = NULL;
+    if (!expect_zset(out, cmd[1], &ent)) {
+        if (out[0] == SER_NIL) {
+            out.clear();  // Clear output if entry is nil
+            out_arr(out, 0);  // Output empty array
+        }
+        return;
+    }
+
+    // Perform zset query
+    if (limit <= 0) {
+        return out_arr(out, 0);  // Output empty array if limit is zero or negative
+    }
+    ZNode *znode = zset_query(ent->zset, score, name.data(), name.size());  // Query zset for tuples
+    znode = znode_offset(znode, offset);  // Offset znode by specified offset
+
+    // Output results
+    void *arr = begin_arr(out);  // Begin serialization of array in output
+    uint32_t n = 0;
+    while (znode && (int64_t)n < limit) {
+        out_str(out, znode->name, znode->len);  // Output tuple name
+        out_dbl(out, znode->score);  // Output tuple score
+        znode = znode_offset(znode, +1);  // Move to next znode
+        n += 2;  // Increment count of serialized elements
+    }
+    end_arr(out, arr, n);  // End serialization of array in output
+}
+
 static bool cmd_is(const string& word, const char* cmd) {
     return strcasecmp(word.c_str(), cmd) == 0; // Compare word with cmd ignoring case differences
 }
 
-static int32_t do_request(vector<string>& cmd, string& out) {
-    if(cmd.size() == 1 && cmd_is(cmd[0], "keys")){
+// Function to handle various commands based on input cmd vector
+static void do_request(std::vector<std::string> &cmd, std::string &out) {
+    // Check the size of the cmd vector and determine the appropriate action based on the command
+    if (cmd.size() == 1 && cmd_is(cmd[0], "keys")) {
+        // Handle "keys" command
         do_keys(cmd, out);
-    } else if (cmd.size() == 2 && cmd_is(cmd[0], "get")) { // Check if the command is a 'get' with the correct number of arguments
+    } else if (cmd.size() == 2 && cmd_is(cmd[0], "get")) {
+        // Handle "get <key>" command
         do_get(cmd, out);
-    } else if (cmd.size() == 3 && cmd_is(cmd[0], "set")) { // Check if the command is a 'set' with the correct number of arguments
+    } else if (cmd.size() == 3 && cmd_is(cmd[0], "set")) {
+        // Handle "set <key> <value>" command
         do_set(cmd, out);
-    } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) { // Check if the command is a 'del' with the correct number of arguments
+    } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
+        // Handle "del <key>" command
         do_del(cmd, out);
+    } else if (cmd.size() == 4 && cmd_is(cmd[0], "zadd")) {
+        // Handle "zadd <zset> <score> <name>" command
+        do_zadd(cmd, out);
+    } else if (cmd.size() == 3 && cmd_is(cmd[0], "zrem")) {
+        // Handle "zrem <zset> <name>" command
+        do_zrem(cmd, out);
+    } else if (cmd.size() == 3 && cmd_is(cmd[0], "zscore")) {
+        // Handle "zscore <zset> <name>" command
+        do_zscore(cmd, out);
+    } else if (cmd.size() == 6 && cmd_is(cmd[0], "zquery")) {
+        // Handle "zquery <zset> <score> <name> <offset> <limit>" command
+        do_zquery(cmd, out);
     } else {
-        out_err(out, ERR_UNKNOWN, "unknown cmd");
+        // Command is not recognized
+        out_err(out, ERR_UNKNOWN, "Unknown cmd");
     }
-    return 0;
 }
 
 static bool try_one_request(Conn* conn) {

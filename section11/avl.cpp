@@ -1,19 +1,4 @@
-#include <stddef.h>
-#include <stdint.h>
-
-struct AVLNode {
-    uint32_t depth = 0;  // Height of the node
-    uint32_t cnt = 0;    // Number of nodes in the subtree
-    AVLNode *left = NULL;  // Pointer to left child
-    AVLNode *right = NULL; // Pointer to right child
-    AVLNode *parent = NULL; // Pointer to parent node
-};
-
-static void avl_init(AVLNode *node) {
-    node->depth = 1;  // Initialize depth to 1
-    node->cnt = 1;    // Initialize count to 1
-    node->left = node->right = node->parent = NULL; // Initialize pointers to NULL
-}
+#include "avl.h"
 
 static uint32_t avl_depth(AVLNode *node) {
     return node ? node->depth : 0;  // Return node depth, 0 if NULL
@@ -78,7 +63,7 @@ static AVLNode *avl_fix_right(AVLNode *root) {
 }
 
 // Fix imbalanced nodes and maintain invariants until the root is reached
-static AVLNode *avl_fix(AVLNode *node) {
+AVLNode *avl_fix(AVLNode *node) {
     while (true) {
         avl_update(node);  // Update node
         uint32_t l = avl_depth(node->left);  // Get left depth
@@ -101,7 +86,7 @@ static AVLNode *avl_fix(AVLNode *node) {
 }
 
 // Detach a node and returns the new root of the tree
-static AVLNode *avl_del(AVLNode *node) {
+AVLNode *avl_del(AVLNode *node) {
     if (node->right == NULL) {
         // No right subtree, replace the node with the left subtree
         // Link the left subtree to the parent
@@ -141,4 +126,34 @@ static AVLNode *avl_del(AVLNode *node) {
             return victim;  // Return victim
         }
     }
+}
+
+// offset into the succeeding or preceding node.
+// note: the worst-case is O(log(n)) regardless of how long the offset is.
+AVLNode *avl_offset(AVLNode *node, int64_t offset) {
+    int64_t pos = 0;    // relative to the starting node
+    while (offset != pos) {  // Continue until the desired offset is reached
+        if (pos < offset && pos + avl_cnt(node->right) >= offset) { 
+            // If the target is in the right subtree
+            node = node->right;  // Move to the right child
+            pos += avl_cnt(node->left) + 1;  // Update position to include left subtree and current node
+        } else if (pos > offset && pos - avl_cnt(node->left) <= offset) {
+            // If the target is in the left subtree
+            node = node->left;  // Move to the left child
+            pos -= avl_cnt(node->right) + 1;  // Update position to include right subtree and current node
+        } else {
+            // If the target is in the parent node
+            AVLNode *parent = node->parent;  // Move to the parent node
+            if (!parent) {  // If there's no parent, the target is out of bounds
+                return NULL;
+            }
+            if (parent->right == node) {  // If the current node is a right child
+                pos -= avl_cnt(node->left) + 1;  // Adjust position to move up from the right subtree
+            } else {  // If the current node is a left child
+                pos += avl_cnt(node->right) + 1;  // Adjust position to move up from the left subtree
+            }
+            node = parent;  // Move to the parent node
+        }
+    }
+    return node;  // Return the node at the desired offset
 }

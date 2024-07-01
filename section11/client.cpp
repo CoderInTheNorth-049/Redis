@@ -10,6 +10,7 @@
 #include <netinet/ip.h>
 #include <string>
 #include <vector>
+#include "common.h"
 
 using namespace std;
 
@@ -81,14 +82,6 @@ static int32_t send_req(int fd, const vector<string>& cmd) {
     return write_all(fd, wbuf, 4 + len); // Write the complete buffer to the socket
 }
 
-enum {
-    SER_NIL = 0,
-    SER_ERR = 1,
-    SER_STR = 2,
-    SER_INT = 3,
-    SER_ARR = 4,
-};
-
 static int32_t on_response(const uint8_t *data, size_t size) {
     if (size < 1) { // Check if the size is less than 1
         msg("bad response"); // Log a bad response message
@@ -140,6 +133,20 @@ static int32_t on_response(const uint8_t *data, size_t size) {
             memcpy(&val, &data[1], 8); // Copy 8 bytes into val
             printf("(int) %ld\n", val); // Print integer value
             return 1 + 8; // Return total bytes processed
+        }
+    case SER_DBL:
+        if (size < 1 + 8) {
+            // If the size of the data is less than the expected size for a double,
+            // print an error message and return -1 to indicate failure.
+            msg("bad response");
+            return -1;
+        }
+        {
+            // Extract the double value from the serialized data.
+            double val = 0;
+            memcpy(&val, &data[1], 8);   // Copy 8 bytes starting from data[1] into val
+            printf("(dbl) %g\n", val);   // Print the extracted double value
+            return 1 + 8;                // Return the total size consumed (1 byte for SER_DBL + 8 bytes for double)
         }
     case SER_ARR: // Handle SER_ARR case
         if (size < 1 + 4) { // Check if size is less than 5 bytes
